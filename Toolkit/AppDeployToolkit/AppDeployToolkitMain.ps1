@@ -746,6 +746,316 @@ If (Test-Path -LiteralPath 'variable:deferDays') {
 ##*=============================================
 #region FunctionListings
 
+
+#region ApplyRegFileToAllUsers
+Function ApplyRegFileToAllUsers
+{
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true)]
+        [string]$regFile
+    )
+
+    # Extract and display user profiles
+    $UserProfiles = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*" | 
+        Where-Object { $_.PSChildName -match "^S-1-5-(21|20)-" } | 
+        Select-Object @{Name = "Name"; Expression = { (Split-Path $_.ProfileImagePath -Leaf) } }, 
+        @{Name = "Path"; Expression = { $_.ProfileImagePath } }, 
+        @{Name = "SID"; Expression = { $_.PSChildName } }
+
+    # Ensure $UserProfiles is an array, even if only one object was retrieved
+    $UserProfiles = @($UserProfiles)
+
+    # Add the TEMPLATE profile for registry alterations
+    $DefaultProfile = New-Object PSObject -Property @{
+        Name = "Default User"
+        Path = "C:\Users\Default"
+        SID  = "TEMPLATE"
+    }
+    $UserProfiles += $DefaultProfile
+
+    # Display the user profiles in a table format for verification
+    Write-Host "Following users found on the system:" -ForegroundColor Cyan
+    $UserProfiles | Format-Table Name, Path, SID -AutoSize
+
+    # Loop through each profile for registry alterations
+    foreach ($UserProfile in $UserProfiles)
+    {
+        $UserHive = "$($UserProfile.Path)\NTUSER.DAT"
+        $hiveLoaded = $false
+
+        # Check if the user's hive is already loaded
+        if (-not (Test-Path "Registry::HKEY_USERS\$($UserProfile.SID)"))
+        {
+            Write-Host "Loading hive for $($UserProfile.Name) (`$UserProfile.SID`)" -ForegroundColor Green
+            try
+            {
+                reg.exe LOAD HKU\$($UserProfile.SID) "$UserHive" | Out-Null
+                $hiveLoaded = $true
+                Write-Host "Hive loaded successfully for $($UserProfile.Name)." -ForegroundColor Magenta
+            }
+            catch
+            {
+                Write-Host "Failed to load hive for $($UserProfile.Name)." -ForegroundColor Red
+            }
+        }
+        else
+        {
+            Write-Host "Hive already loaded for $($UserProfile.Name)." -ForegroundColor Yellow
+        }
+
+        # Registry modification placeholder
+        Write-Host "Applying registry modifications for $($UserProfile.Name) with SID $($UserProfile.SID)..." -ForegroundColor White
+        
+        # Apply registry modifications from the provided .reg file to the user hive
+        RegFileToRegistry -path $regFile -userhive $UserProfile.SID
+
+        # Unload the NTUSER.DAT if it was loaded by this script
+        if ($hiveLoaded)
+        {
+            Write-Host "Attempting to unload hive for $($UserProfile.Name)" -ForegroundColor Green
+            [gc]::Collect()
+            Start-Sleep 15        
+            $unloadProcess = Start-Process reg.exe -ArgumentList "UNLOAD HKU\$($UserProfile.SID)" -NoNewWindow -Wait -PassThru -RedirectStandardError "unloadError.txt"
+            if ($unloadProcess.ExitCode -ne 0)
+            {
+                # If the exit code indicates an error, read and display the error message
+                $errorMessage = Get-Content "unloadError.txt"
+                Write-Host "Failed to unload hive for $($UserProfile.Name). Error: $errorMessage" -ForegroundColor Red
+            }
+            else
+            {
+                Write-Host "Hive unloaded successfully for $($UserProfile.Name)." -ForegroundColor Magenta
+            }
+        }
+
+        Write-Host "Registry modifications completed for $($UserProfile.Name)." -ForegroundColor White
+    }
+
+    Write-Host "Completed registry modifications for all users." -ForegroundColor Green
+}
+#endregion
+
+
+
+#region RegFileToRegistry
+Function RegFileToRegistry
+{
+    ## Usage
+    # Add nothing to HKLM and add HKCU to to a specfic userhive
+    # RegFileToRegistry -path "C:\Users\Test\Desktop\application_settings.reg"-userhive S-1-5-21-629199317-1840177931-3036710913-1001
+
+    # Add HKLM and current user HKCU
+    # RegFileToRegistry -path "C:\Users\Test\Desktop\user.reg"
+
+    [CmdLetBinding()]
+    Param(
+        [Parameter(ValueFromPipeline = $true, Mandatory = $true)] 
+        [ValidateNotNullOrEmpty()]
+        [Alias("FullName")]
+        [string]$path,
+        
+        [Parameter()]
+        [string]$userhive,
+        [string]$Encoding = "utf8"
+    )
+
+    Begin
+    {
+        $hive = @{
+            "HKEY_CLASSES_ROOT"   = "HKCR:"
+            "HKEY_CURRENT_CONFIG" = "HKCC:"
+            "HKEY_CURRENT_USER"   = "HKCU:"
+            "HKEY_LOCAL_MACHINE"  = "HKLM:"
+            "HKEY_USERS"          = "HKU:"
+        }
+        [system.boolean]$isfolder = $false
+        $addedpath = @()
+    }
+
+    Process
+    {
+        if (Test-Path $path -PathType container)
+        {
+            $files = (Get-ChildItem -Path $path -Recurse -Force -File -Filter "*.reg").fullname; $isfolder = $true 
+        }
+        else
+        {
+            if ($path.endswith(".reg"))
+            {
+                $files = $path 
+            } 
+        }
+        foreach ($File in $Files)
+        {
+            $Commands = @()
+            foreach ($root in $hive.keys)
+            {
+                if ((Get-Content -Path $file -Raw) -match $root -and $hive[$root] -notin ('HKCU:', 'HKLM:'))
+                {
+                    $commands += "New-PSDrive -Name $($hive[$root].replace(':', '')) -PSProvider Registry -Root $root"
+                }
+            }
+            [string]$text = $nul
+            $FileContent = Get-Content $File | Where-Object { ![string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() }
+            $joinedlines = @()
+            foreach ($line in $FileContent)
+            {
+                if ($line.EndsWith("\"))
+                {
+                    $text = $text + ($line -replace "\\$").trim()
+                }
+                else
+                {
+                    $joinedlines += $text + $line
+                    [string]$text = $nul
+                }
+            }
+
+            foreach ($joinedline in $joinedlines)
+            {
+                if ($joinedline -match "\[HKEY(.*)+\]")
+                {
+                    $key = $joinedline -replace '\[-?|\]'
+                    $hivename = $key.split('\')[0]
+                    $key = '"' + ($key -replace $hivename, $hive.$hivename) + '"'
+                    if ($joinedline.StartsWith("[-HKEY"))
+                    {
+                        $Commands += 'Remove-Item -Path {0} -Force -Recurse' -f $key
+                    }
+                    else
+                    {
+                        if ($key -notin $addedpath)
+                        {
+                            #  $Commands += 'New-Item -Path {0} -ErrorAction SilentlyContinue | Out-Null' -f $key
+                            $Commands += 'New-Item -Path {0} -Force' -f $key
+                            $addedpath += $key
+                        }
+                    }
+                }
+                elseif ($joinedline -match "`"([^`"=]+)`"=")
+                {
+                    [System.Boolean]$delete = $false
+                    $name = ($joinedline | Select-String -Pattern "`"([^`"=]+)`"").matches.value | Select-Object -First 1
+                    switch ($joinedline)
+                    {
+                        { $joinedline -match "=-" }
+                        {
+                            $Commands += 'Remove-ItemProperty -Path {0} -Name {1} -Force' -f $key, $Name; $delete = $true 
+                        }
+                        { $joinedline -match '"="' }
+                        {
+                            $type = "String"
+                            $value = $joinedline -replace "`"([^`"=]+)`"="
+                        }
+                        { $joinedline -match "dword" }
+                        {
+                            $type = "Dword"
+                            $value = $joinedline -replace "`"([^`"=]+)`"=dword:"
+                            $value = "0x" + $value
+                        }
+                        { $joinedline -match "qword" }
+                        {
+                            $type = "Qword"
+                            $value = $joinedline -replace "`"([^`"=]+)`"=qword:"
+                            $value = "0x" + $value
+                        }
+                        { $joinedline -match "hex(\([2,7,b]\))?:" }
+                        {
+                            $value = ($joinedline -replace "`"[^`"=]+`"=hex(\([2,7,b]\))?:").split(",")
+                            $hextype = ($joinedline | Select-String -Pattern "hex(\([2,7,b]\))?").matches.value
+                            switch ($hextype)
+                            {
+                                { $hextype -match 'hex(\([2,7])\)' }
+                                {
+                                    $ValueEx = '$value = for ($i = 0; $i -lt $value.count; $i += 2) {if ($value[$i] -ne "00") {[string][char][int]("0x" + $value[$i])}'
+                                    switch ($hextype)
+                                    {
+                                        'hex(2)'
+                                        {
+                                            $type = "ExpandString"; Invoke-Expression $($ValueEx + '}') 
+                                        }
+                                        'hex(7)'
+                                        {
+                                            $type = "MultiString"; Invoke-Expression $($ValueEx + ' else {","}}'); $value = 0..$($value.count - 3) | % { $value[$_] } 
+                                        }
+                                    }
+                                    $value = $value -join ""
+                                    if ($type -eq "ExpandString")
+                                    {
+                                        $value = '"' + $value + '"' 
+                                    }
+                                    else
+                                    {
+                                        $value = foreach ($seg in $value.split(','))
+                                        {
+                                            '"' + $seg + '"'
+                                        }; $value = $value -join ','
+                                    }
+                                }
+                                'hex(b)'
+                                {
+                                    $type = "Qword"
+                                    $value = for ($i = $value.count - 1; $i -ge 0; $i--)
+                                    {
+                                        $value[$i] 
+                                    }
+                                    $value = '0x' + ($value -join "").trimstart('0')
+                                }
+                                'hex'
+                                {
+                                    $type = "Binary"
+                                    $value = $value | % { '0x' + $_ }
+                                    $value = '([byte[]]$(' + $($value -join ",") + '))'
+                                }
+                            }
+                        }
+                    }
+                    if (!$delete)
+                    {
+                        $Commands += 'Set-ItemProperty -Path {0} -Name {1} -Type {2} -Value {3} -Force' -f $key, $name, $type, $value
+                    }
+                }
+                elseif ($joinedline -match "@=")
+                {
+                    $name = '"(Default)"'; $type = 'string'; $value = $joinedline -replace '@='
+                    $commands += 'Set-ItemProperty -Path {0} -Name {1} -Type {2} -Value {3}' -f $key, $name, $type, $value
+                }
+            
+            }
+
+            # Check if $userhive is not provided
+            if ($userhive)
+            {
+                # Define the search and replace strings
+                $searchString = "HKCU:"
+                $replaceString = "registry::HKEY_USERS\$($userhive)"
+
+                # Iterate through each element in the $Commands array
+                foreach ($command in $Commands)
+                {
+                    # Perform the search and replace operation on the command
+                    $modifiedCommand = $command -replace $searchString, $replaceString
+
+                    # Update the command in the $Commands array with the modified command
+                    $Commands[$Commands.IndexOf($command)] = $modifiedCommand
+                } 
+            }
+
+
+            $Commands | Out-File -FilePath $($file.replace('.reg', '_reg.ps1')) -Encoding $encoding
+            $Commands | ForEach-Object { Invoke-Expression $_ }
+        }
+        if ($isfolder)
+        {
+            $allcommands = (Get-ChildItem -Path $path -Recurse -Force -File -Filter "*_reg.ps1").fullname | Where-Object { $_ -notmatch "allcommands_reg" } | ForEach-Object { Get-Content $_ }
+            $allcommands | Out-File -path "${path}\allcommands_reg.ps1" -Encoding $encoding
+        }
+    }
+}
+
+#endregion
+
 #region Function Write-FunctionHeaderOrFooter
 Function Write-FunctionHeaderOrFooter {
     <#
